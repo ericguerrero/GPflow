@@ -804,3 +804,28 @@ class Prod(Combination):
 
     def Kdiag(self, X, presliced=False):
         return reduce(tf.multiply, [k.Kdiag(X) for k in self.kern_list])
+
+# Neural Net kernel
+class NN(Parameterized):
+    def __init__(self, dims):
+        Parameterized.__init__(self)
+        self.dims = dims
+        for i, (dim_in, dim_out) in enumerate(zip(dims[:-1], dims[1:])):
+            setattr(self, 'W_{}'.format(i), Param(np.random.randn(dim_in, dim_out)*(2./(dim_in+dim_out))**0.5))
+            setattr(self, 'b_{}'.format(i), Param(np.zeros(dim_out)))
+
+    def forward(self, X):
+        if X is not None:
+            for i in range(len(self.dims) - 1):
+                W = getattr(self, 'W_{}'.format(i))
+                b = getattr(self, 'b_{}'.format(i))
+                X = tf.nn.tanh(tf.matmul(X, W) + b)
+            return X
+
+class NN_RBF(RBF):
+    def __init__(self, nn, *args, **kw):
+        RBF.__init__(self, *args, **kw)
+        self.nn = nn
+    
+    def square_dist(self, X, X2):
+        return RBF.square_dist(self, self.nn.forward(X), self.nn.forward(X2))
