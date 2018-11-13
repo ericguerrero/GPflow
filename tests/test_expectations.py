@@ -10,7 +10,7 @@
 # distributed under the License is distributed on an "AS IS" BASIS,
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
-# limitations under the License.from __future__ import print_function
+# limitations under the License.
 
 import numpy as np
 import tensorflow as tf
@@ -19,7 +19,6 @@ import copy
 import pytest
 
 import gpflow
-from gpflow import test_util
 from gpflow.expectations import expectation, quadrature_expectation
 from gpflow.probability_distributions import Gaussian, DiagonalGaussian, MarkovGaussian
 from gpflow import kernels, mean_functions, features
@@ -43,12 +42,23 @@ class Data:
     Xcov = rng.randn(num_data, D_in, D_in)
     Xcov = Xcov @ np.transpose(Xcov, (0, 2, 1))
     Z = rng.randn(num_ind, D_in)
+    Z2 = rng.randn(num_ind - 1, D_in)
+    
+    cov_params = rng.randn(num_data + 1, D_in, 2 * D_in) / 2.  # (N+1)xDx2D
+    NN_cov = cov_params @ np.transpose(cov_params, (0, 2, 1))  # (N+1)xDxD
+    NNplus1_cross = cov_params[:-1] @ np.transpose(cov_params[1:], (0, 2, 1))  # NxDxD
+    NNplus1_cross = np.concatenate((NNplus1_cross, np.zeros((1, D_in, D_in))), 0)  # (N+1)xDxD
+    Xcov_markov = np.stack([NN_cov, NNplus1_cross])  # 2x(N+1)xDxD
 
 
 @pytest.fixture
-def feature(session_tf):
+def feature():
     return features.InducingPoints(Data.Z)
 
+
+@cache_tensor
+def feature2():
+    return features.InducingPoints(Data.Z2)
 
 @cache_tensor
 def gauss():
@@ -80,15 +90,9 @@ def dirac_diag():
 
 @cache_tensor
 def markov_gauss():
-    D_in = Data.D_in
-    cov_params = rng.randn(Data.num_data + 1, D_in, 2 * D_in) / 2.  # (N+1)xDx2D
-    Xcov = cov_params @ np.transpose(cov_params, (0, 2, 1))  # (N+1)xDxD
-    Xcross = cov_params[:-1] @ np.transpose(cov_params[1:], (0, 2, 1))  # NxDxD
-    Xcross = np.concatenate((Xcross, np.zeros((1, D_in, D_in))), 0)  # (N+1)xDxD
-    Xcov = np.stack([Xcov, Xcross])  # 2x(N+1)xDxD
     return MarkovGaussian(
         tf.convert_to_tensor(Data.Xmu_markov),
-        tf.convert_to_tensor(Xcov))
+        tf.convert_to_tensor(Data.Xcov_markov))
 
 
 @cache_tensor
@@ -102,10 +106,19 @@ def dirac_markov_gauss():
 def rbf_kern():
     return kernels.RBF(Data.D_in, variance=rng.rand(), lengthscales=rng.rand() + 1.)
 
+@cache_tensor
+def rbf_kern_2():
+    # Additional cached rbf kernel for rbf cross covariance tests 
+    return kernels.RBF(Data.D_in, variance=rng.rand(), lengthscales=rng.rand() + 1.)
 
 @cache_tensor
 def lin_kern():
     return kernels.Linear(Data.D_in, variance=rng.rand())
+
+
+@cache_tensor
+def matern_kern():
+    return kernels.Matern32(Data.D_in, variance=rng.rand())
 
 
 @cache_tensor
@@ -208,7 +221,7 @@ def test_kernel_only_expectations(session_tf, distribution, kernel, feature, arg
 
 
 @pytest.mark.parametrize("distribution", [gauss])
-@pytest.mark.parametrize("kernel", [rbf_kern, lin_kern, rbf_lin_sum_kern])
+@pytest.mark.parametrize("kernel", [rbf_kern, lin_kern, matern_kern, rbf_lin_sum_kern])
 @pytest.mark.parametrize("mean", [lin_mean, identity_mean, const_mean, zero_mean])
 @pytest.mark.parametrize("arg_filter",
                          [lambda p, k, f, m: (p, (k, f), m),
@@ -255,6 +268,26 @@ def test_eKzxKxz_no_uncertainty(session_tf, kernel, feature):
     assert_allclose(eKzxKxz, KzxKxz, rtol=RTOL)
 
 
+def test_RBF_eKzxKxz_gradient_not_NaN(session_tf):
+    """
+    Ensure that <K_{Z, x} K_{x, Z}>_p(x) is not NaN and correct, when
+    K_{Z, Z} is zero with finite precision. See pull request #595.
+    """
+    kern = gpflow.kernels.RBF(1, lengthscales=0.1)
+    kern.variance = 2.
+
+    p = gpflow.probability_distributions.Gaussian(
+        tf.constant([[10]], dtype=gpflow.settings.tf_float),
+        tf.constant([[[0.1]]], dtype=gpflow.settings.tf_float))
+    z = gpflow.features.InducingPoints([[-10.], [10.]])
+
+    ekz = expectation(p, (kern, z), (kern, z))
+
+    g, = tf.gradients(ekz, kern.lengthscales._unconstrained_tensor)
+    grad = session_tf.run(g)
+    assert grad is not None and not np.isnan(grad)
+
+
 @pytest.mark.parametrize("kernel1", [rbf_kern_act_dim_0, lin_kern_act_dim_0])
 @pytest.mark.parametrize("kernel2", [rbf_kern_act_dim_1, lin_kern_act_dim_1])
 def test_eKzxKxz_separate_dims_simplification(
@@ -298,3 +331,14 @@ def test_cov_shape_inference(session_tf, distribution, feature):
     _check((gauss_tuple, (rbf_kern(), feature)))
     if isinstance(distribution(), MarkovGaussian):
         _check((gauss_tuple, None, (rbf_kern(), feature)))
+
+
+@pytest.mark.parametrize("distribution", [gauss, gauss_diag])
+@pytest.mark.parametrize("kernel1", [rbf_kern, rbf_kern_2])
+@pytest.mark.parametrize("kernel2", [rbf_kern, rbf_kern_2])
+@pytest.mark.parametrize("feat1", [feature, feature2])
+@pytest.mark.parametrize("feat2", [feature, feature2])
+def test_eKzxKxz_rbf_cross_covariance(session_tf,
+                                      distribution, kernel1, kernel2,
+                                      feat1, feat2):
+    _check((distribution(), (kernel1(), feat1()), (kernel2(), feat2())))

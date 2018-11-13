@@ -14,7 +14,6 @@
 # limitations under the License.
 
 
-from __future__ import print_function, absolute_import
 from functools import reduce
 import warnings
 
@@ -24,7 +23,7 @@ import numpy as np
 from . import transforms
 from . import settings
 
-from .params import Parameter, Parameterized
+from .params import Parameter, Parameterized, ParamList
 from .decors import params_as_tensors, autoflow
 
 
@@ -55,12 +54,37 @@ class Kernel(Parameterized):
         elif isinstance(active_dims, slice):
             self.active_dims = active_dims
             if active_dims.start is not None and active_dims.stop is not None and active_dims.step is not None:
-                assert len(range(*active_dims)) == input_dim  # pragma: no cover
+                assert len(range(active_dims.start, active_dims.stop, active_dims.step)) == input_dim  # pragma: no cover
         else:
             self.active_dims = np.array(active_dims, dtype=np.int32)
             assert len(active_dims) == input_dim
 
-        self.num_gauss_hermite_points = 20
+    def _validate_ard_shape(self, name, value, ARD=None):
+        """
+        Validates the shape of a potentially ARD hyperparameter
+
+        :param name: The name of the parameter (used for error messages)
+        :param value: A scalar or an array.
+        :param ARD: None, False, or True. If None, infers ARD from shape of value.
+        :return: Tuple (value, ARD), where _value_ is a scalar if input_dim==1 or not ARD, array otherwise.
+            The _ARD_ is False if input_dim==1 or not ARD, True otherwise.
+        """
+        if ARD is None:
+            ARD = np.asarray(value).squeeze().shape != ()
+
+        if ARD:
+            # accept float or array:
+            value = value * np.ones(self.input_dim, dtype=settings.float_type)
+
+        if self.input_dim == 1 or not ARD:
+            correct_shape = ()
+        else:
+            correct_shape = (self.input_dim,)
+
+        if np.asarray(value).squeeze().shape != correct_shape:
+            raise ValueError("shape of {} does not match input_dim".format(name))
+
+        return value, ARD
 
     @autoflow((settings.float_type, [None, None]),
               (settings.float_type, [None, None]))
@@ -98,14 +122,15 @@ class Kernel(Parameterized):
         :return: Sliced X, X2, (Nxself.input_dim).
         """
         if isinstance(self.active_dims, slice):
-            X = X[:, self.active_dims]
+            X = X[..., self.active_dims]
             if X2 is not None:
-                X2 = X2[:, self.active_dims]
+                X2 = X2[..., self.active_dims]
         else:
-            X = tf.transpose(tf.gather(tf.transpose(X), self.active_dims))
+            X = tf.gather(X, self.active_dims, axis=-1)
             if X2 is not None:
-                X2 = tf.transpose(tf.gather(tf.transpose(X2), self.active_dims))
-        input_dim_shape = tf.shape(X)[1]
+                X2 = tf.gather(X2, self.active_dims, axis=-1)
+
+        input_dim_shape = tf.shape(X)[-1]
         input_dim = tf.convert_to_tensor(self.input_dim, dtype=settings.tf_int)
         with tf.control_dependencies([tf.assert_equal(input_dim_shape, input_dim)]):
             X = tf.identity(X)
@@ -149,11 +174,12 @@ class Static(Kernel):
 
     def __init__(self, input_dim, variance=1.0, active_dims=None, name=None):
         super().__init__(input_dim, active_dims, name=name)
-        self.variance = Parameter(variance, transform=transforms.positive)
+        self.variance = Parameter(variance, transform=transforms.positive,
+                                  dtype=settings.float_type)
 
     @params_as_tensors
     def Kdiag(self, X):
-        return tf.fill(tf.stack([tf.shape(X)[0]]), tf.squeeze(self.variance))
+        return tf.fill(tf.shape(X)[:-1], tf.squeeze(self.variance))
 
 
 class White(Static):
@@ -164,10 +190,12 @@ class White(Static):
     @params_as_tensors
     def K(self, X, X2=None, presliced=False):
         if X2 is None:
-            d = tf.fill(tf.stack([tf.shape(X)[0]]), tf.squeeze(self.variance))
+            d = tf.fill(tf.shape(X)[:-1], tf.squeeze(self.variance))
             return tf.matrix_diag(d)
         else:
-            shape = tf.stack([tf.shape(X)[0], tf.shape(X2)[0]])
+            shape = tf.concat([tf.shape(X)[:-2],
+                               tf.reshape(tf.shape(X)[-2], [1]),
+                               tf.reshape(tf.shape(X2)[-2], [1])], 0)
             return tf.zeros(shape, settings.float_type)
 
 
@@ -179,9 +207,10 @@ class Constant(Static):
     @params_as_tensors
     def K(self, X, X2=None, presliced=False):
         if X2 is None:
-            shape = tf.stack([tf.shape(X)[0], tf.shape(X)[0]])
-        else:
-            shape = tf.stack([tf.shape(X)[0], tf.shape(X2)[0]])
+            X2 = X
+        shape = tf.concat([tf.shape(X)[:-2],
+                           tf.reshape(tf.shape(X)[-2], [1]),
+                           tf.reshape(tf.shape(X2)[-2], [1])], 0)
         return tf.fill(shape, tf.squeeze(self.variance))
 
 
@@ -203,8 +232,8 @@ class Stationary(Kernel):
     dimension, otherwise the kernel is isotropic (has a single lengthscale).
     """
 
-    def __init__(self, input_dim, variance=1.0, lengthscales=None,
-                 active_dims=None, ARD=False, name=None):
+    def __init__(self, input_dim, variance=1.0, lengthscales=1.0,
+                 active_dims=None, ARD=None, name=None):
         """
         - input_dim is the dimension of the input to the kernel
         - variance is the (initial) value for the variance parameter
@@ -212,42 +241,21 @@ class Stationary(Kernel):
           defaults to 1.0 (ARD=False) or np.ones(input_dim) (ARD=True).
         - active_dims is a list of length input_dim which controls which
           columns of X are used.
-        - ARD specifies whether the kernel has one lengthscale per dimension
-          (ARD=True) or a single lengthscale (ARD=False).
+        - if ARD is not None, it specifies whether the kernel has one
+          lengthscale per dimension (ARD=True) or a single lengthscale
+          (ARD=False). Otherwise, inferred from shape of lengthscales.
         """
         super().__init__(input_dim, active_dims, name=name)
-        self.variance = Parameter(variance, transform=transforms.positive)
-        if ARD:
-            if lengthscales is None:
-                lengthscales = np.ones(input_dim, dtype=settings.float_type)
-            else:
-                # accepts float or array:
-                lengthscales = lengthscales * np.ones(input_dim, dtype=settings.float_type)
-            self.lengthscales = Parameter(lengthscales, transform=transforms.positive)
-            self.ARD = True
-        else:
-            if lengthscales is None:
-                lengthscales = 1.0
-            self.lengthscales = Parameter(lengthscales, transform=transforms.positive)
-            self.ARD = False
+        self.variance = Parameter(variance, transform=transforms.positive,
+                                  dtype=settings.float_type)
 
-
-    def square_dist(self, X, X2):  # pragma: no cover
-        warnings.warn('square_dist is deprecated and will be removed at '
-                      'GPflow version 1.2.0. Use scaled_square_dist.',
-                      DeprecationWarning)
-        return self.scaled_square_dist(X, X2)
-
-
-    def euclid_dist(self, X, X2):  # pragma: no cover
-        warnings.warn('euclid_dist is deprecated and will be removed at '
-                      'GPflow version 1.2.0. Use scaled_euclid_dist.',
-                      DeprecationWarning)
-        return self.scaled_euclid_dist(X, X2)
+        lengthscales, self.ARD = self._validate_ard_shape("lengthscales", lengthscales, ARD)
+        self.lengthscales = Parameter(lengthscales, transform=transforms.positive,
+                                      dtype=settings.float_type)
 
 
     @params_as_tensors
-    def scaled_square_dist(self, X, X2):
+    def _scaled_square_dist(self, X, X2):
         """
         Returns ((X - X2ᵀ)/lengthscales)².
         Due to the implementation and floating-point imprecision, the
@@ -255,44 +263,87 @@ class Stationary(Kernel):
         close to each other.
         """
         X = X / self.lengthscales
-        Xs = tf.reduce_sum(tf.square(X), axis=1)
+        Xs = tf.reduce_sum(tf.square(X), axis=-1, keepdims=True)
 
         if X2 is None:
             dist = -2 * tf.matmul(X, X, transpose_b=True)
-            dist += tf.reshape(Xs, (-1, 1))  + tf.reshape(Xs, (1, -1))
+            dist += Xs + tf.matrix_transpose(Xs)
             return dist
 
         X2 = X2 / self.lengthscales
-        X2s = tf.reduce_sum(tf.square(X2), axis=1)
+        X2s = tf.reduce_sum(tf.square(X2), axis=-1, keepdims=True)
         dist = -2 * tf.matmul(X, X2, transpose_b=True)
-        dist += tf.reshape(Xs, (-1, 1)) + tf.reshape(X2s, (1, -1))
+        dist += Xs + tf.matrix_transpose(X2s)
         return dist
 
 
-    def scaled_euclid_dist(self, X, X2):
+    @staticmethod
+    def _clipped_sqrt(r2):
+        # Clipping around the (single) float precision which is ~1e-45.
+        return tf.sqrt(tf.maximum(r2, 1e-40))
+
+    def scaled_square_dist(self, X, X2):  # pragma: no cover
+        return self._scaled_square_dist(X, X2)
+
+    def scaled_euclid_dist(self, X, X2):  # pragma: no cover
         """
         Returns |(X - X2ᵀ)/lengthscales| (L2-norm).
         """
+        warnings.warn('scaled_euclid_dist is deprecated and will be removed '
+                      'in GPflow version 1.4.0. For stationary kernels, '
+                      'define K_r(r) instead.',
+                      DeprecationWarning)
         r2 = self.scaled_square_dist(X, X2)
-        return tf.sqrt(r2 + 1e-12)
+        return self._clipped_sqrt(r2)
+
 
     @params_as_tensors
     def Kdiag(self, X, presliced=False):
-        return tf.fill(tf.stack([tf.shape(X)[0]]), tf.squeeze(self.variance))
+        return tf.fill(tf.shape(X)[:-1], tf.squeeze(self.variance))
+
+    @params_as_tensors
+    def K(self, X, X2=None, presliced=False):
+        """
+        Calculates the kernel matrix K(X, X2) (or K(X, X) if X2 is None).
+        Handles the slicing as well as scaling and computes k(x, x') = k(r),
+        where r² = ((x - x')/lengthscales)².
+
+        Internally, this calls self.K_r2(r²), which in turn computes the
+        square-root and calls self.K_r(r). Classes implementing stationary
+        kernels can either overwrite `K_r2(r2)` if they only depend on the
+        squared distance, or `K_r(r)` if they need the actual radial distance.
+        """
+        if not presliced:
+            X, X2 = self._slice(X, X2)
+        return self.K_r2(self.scaled_square_dist(X, X2))
+
+    @params_as_tensors
+    def K_r(self, r):
+        """
+        Returns the kernel evaluated on `r`, which is the scaled Euclidean distance
+        Should operate element-wise on r
+        """
+        raise NotImplementedError
+
+    def K_r2(self, r2):
+        """
+        Returns the kernel evaluated on `r2`, which is the scaled squared distance.
+        Will call self.K_r(r=sqrt(r2)), or can be overwritten directly (and should operate element-wise on r2).
+        """
+        r = self._clipped_sqrt(r2)
+        return self.K_r(r)
 
 
-class RBF(Stationary):
+class SquaredExponential(Stationary):
     """
     The radial basis function (RBF) or squared exponential kernel
     """
 
     @params_as_tensors
-    def K(self, X, X2=None, presliced=False):
-        if not presliced:
-            X, X2 = self._slice(X, X2)
-        return self.variance * tf.exp(-self.scaled_square_dist(X, X2) / 2)
+    def K_r2(self, r2):
+        return self.variance * tf.exp(-r2 / 2.)
 
-SquaredExponential = RBF
+RBF = SquaredExponential
 
 
 class RationalQuadratic(Stationary):
@@ -308,17 +359,15 @@ class RationalQuadratic(Stationary):
     For α → ∞, the RQ kernel becomes equivalent to the squared exponential.
     """
 
-    def __init__(self, input_dim, variance=1.0, lengthscales=None, alpha=1.0,
-                 active_dims=None, ARD=False, name=None):
+    def __init__(self, input_dim, variance=1.0, lengthscales=1.0, alpha=1.0,
+                 active_dims=None, ARD=None, name=None):
         super().__init__(input_dim, variance, lengthscales, active_dims, ARD, name)
-        self.alpha = Parameter(alpha, transform=transforms.positive)
+        self.alpha = Parameter(alpha, transform=transforms.positive,
+                               dtype=settings.float_type)
 
     @params_as_tensors
-    def K(self, X, X2=None, presliced=False):
-        if not presliced:
-            X, X2 = self._slice(X, X2)
-        return self.variance * (1 + self.scaled_square_dist(X, X2) /
-                                (2 * self.alpha)) ** (- self.alpha)
+    def K_r2(self, r2):
+        return self.variance * (1 + r2 / (2 * self.alpha)) ** (- self.alpha)
 
 
 class Linear(Kernel):
@@ -326,7 +375,7 @@ class Linear(Kernel):
     The linear kernel
     """
 
-    def __init__(self, input_dim, variance=1.0, active_dims=None, ARD=False, name=None):
+    def __init__(self, input_dim, variance=1.0, active_dims=None, ARD=None, name=None):
         """
         - input_dim is the dimension of the input to the kernel
         - variance is the (initial) value for the variance parameter(s)
@@ -335,13 +384,10 @@ class Linear(Kernel):
           which columns of X are used.
         """
         super().__init__(input_dim, active_dims, name=name)
-        self.ARD = ARD
-        if ARD:
-            # accept float or array:
-            variance = np.ones(self.input_dim, dtype=settings.float_type) * variance
-            self.variance = Parameter(variance, transform=transforms.positive)
-        else:
-            self.variance = Parameter(variance, transform=transforms.positive)
+
+        variance, self.ARD = self._validate_ard_shape("variance", variance, ARD)
+        self.variance = Parameter(variance, transform=transforms.positive,
+                                  dtype=settings.float_type)
 
     @params_as_tensors
     def K(self, X, X2=None, presliced=False):
@@ -356,7 +402,7 @@ class Linear(Kernel):
     def Kdiag(self, X, presliced=False):
         if not presliced:
             X, _ = self._slice(X, None)
-        return tf.reduce_sum(tf.square(X) * self.variance, 1)
+        return tf.reduce_sum(tf.square(X) * self.variance, -1)
 
 
 class Polynomial(Linear):
@@ -369,7 +415,7 @@ class Polynomial(Linear):
                  variance=1.0,
                  offset=1.0,
                  active_dims=None,
-                 ARD=False,
+                 ARD=None,
                  name=None):
         """
         :param input_dim: the dimension of the input to the kernel
@@ -382,7 +428,8 @@ class Polynomial(Linear):
         """
         super().__init__(input_dim, variance, active_dims, ARD, name=name)
         self.degree = degree
-        self.offset = Parameter(offset, transform=transforms.positive)
+        self.offset = Parameter(offset, transform=transforms.positive,
+                                dtype=settings.float_type)
 
     @params_as_tensors
     def K(self, X, X2=None, presliced=False):
@@ -399,10 +446,7 @@ class Exponential(Stationary):
     """
 
     @params_as_tensors
-    def K(self, X, X2=None, presliced=False):
-        if not presliced:
-            X, X2 = self._slice(X, X2)
-        r = self.scaled_euclid_dist(X, X2)
+    def K_r(self, r):
         return self.variance * tf.exp(-0.5 * r)
 
 
@@ -412,10 +456,7 @@ class Matern12(Stationary):
     """
 
     @params_as_tensors
-    def K(self, X, X2=None, presliced=False):
-        if not presliced:
-            X, X2 = self._slice(X, X2)
-        r = self.scaled_euclid_dist(X, X2)
+    def K_r(self, r):
         return self.variance * tf.exp(-r)
 
 
@@ -425,12 +466,9 @@ class Matern32(Stationary):
     """
 
     @params_as_tensors
-    def K(self, X, X2=None, presliced=False):
-        if not presliced:
-            X, X2 = self._slice(X, X2)
-        r = self.scaled_euclid_dist(X, X2)
-        return self.variance * (1. + np.sqrt(3.) * r) * \
-               tf.exp(-np.sqrt(3.) * r)
+    def K_r(self, r):
+        sqrt3 = np.sqrt(3.)
+        return self.variance * (1. + sqrt3 * r) * tf.exp(-sqrt3 * r)
 
 
 class Matern52(Stationary):
@@ -439,12 +477,9 @@ class Matern52(Stationary):
     """
 
     @params_as_tensors
-    def K(self, X, X2=None, presliced=False):
-        if not presliced:
-            X, X2 = self._slice(X, X2)
-        r = self.scaled_euclid_dist(X, X2)
-        return self.variance * (1.0 + np.sqrt(5.) * r + 5. / 3. * tf.square(r)) \
-               * tf.exp(-np.sqrt(5.) * r)
+    def K_r(self, r):
+        sqrt5 = np.sqrt(5.)
+        return self.variance * (1.0 + sqrt5 * r + 5. / 3. * tf.square(r)) * tf.exp(-sqrt5 * r)
 
 
 class Cosine(Stationary):
@@ -453,10 +488,7 @@ class Cosine(Stationary):
     """
 
     @params_as_tensors
-    def K(self, X, X2=None, presliced=False):
-        if not presliced:
-            X, X2 = self._slice(X, X2)
-        r = self.scaled_euclid_dist(X, X2)
+    def K_r(self, r):
         return self.variance * tf.cos(r)
 
 
@@ -482,7 +514,7 @@ class ArcCosine(Kernel):
     def __init__(self, input_dim,
                  order=0,
                  variance=1.0, weight_variances=1., bias_variance=1.,
-                 active_dims=None, ARD=False, name=None):
+                 active_dims=None, ARD=None, name=None):
         """
         - input_dim is the dimension of the input to the kernel
         - order specifies the activation function of the neural network
@@ -503,26 +535,18 @@ class ArcCosine(Kernel):
             raise ValueError('Requested kernel order is not implemented.')
         self.order = order
 
-        self.variance = Parameter(variance, transform=transforms.positive)
-        self.bias_variance = Parameter(bias_variance, transform=transforms.positive)
-        if ARD:
-            if weight_variances is None:
-                weight_variances = np.ones(input_dim, settings.float_type)
-            else:
-                # accepts float or array:
-                weight_variances = weight_variances * np.ones(input_dim, settings.float_type)
-            self.weight_variances = Parameter(weight_variances, transform=transforms.positive)
-            self.ARD = True
-        else:
-            if weight_variances is None:
-                weight_variances = 1.0
-            self.weight_variances = Parameter(weight_variances, transform=transforms.positive)
-            self.ARD = False
+        self.variance = Parameter(variance, transform=transforms.positive,
+                                  dtype=settings.float_type)
+        self.bias_variance = Parameter(bias_variance, transform=transforms.positive,
+                                       dtype=settings.float_type)
+        weight_variances, self.ARD = self._validate_ard_shape("weight_variances", weight_variances, ARD)
+        self.weight_variances = Parameter(weight_variances, transform=transforms.positive,
+                                          dtype=settings.float_type)
 
     @params_as_tensors
     def _weighted_product(self, X, X2=None):
         if X2 is None:
-            return tf.reduce_sum(self.weight_variances * tf.square(X), axis=1) + self.bias_variance
+            return tf.reduce_sum(self.weight_variances * tf.square(X), axis=-1) + self.bias_variance
         return tf.matmul((self.weight_variances * X), X2, transpose_b=True) + self.bias_variance
 
     def _J(self, theta):
@@ -551,13 +575,15 @@ class ArcCosine(Kernel):
             X2_denominator = tf.sqrt(self._weighted_product(X2))
 
         numerator = self._weighted_product(X, X2)
-        cos_theta = numerator / X_denominator[:, None] / X2_denominator[None, :]
+        X_denominator = tf.expand_dims(X_denominator, -1)
+        X2_denominator = tf.matrix_transpose(tf.expand_dims(X2_denominator, -1))
+        cos_theta = numerator / X_denominator / X2_denominator
         jitter = 1e-15
         theta = tf.acos(jitter + (1 - 2 * jitter) * cos_theta)
 
         return self.variance * (1. / np.pi) * self._J(theta) * \
-               X_denominator[:, None] ** self.order * \
-               X2_denominator[None, :] ** self.order
+               X_denominator ** self.order * \
+               X2_denominator ** self.order
 
     @params_as_tensors
     def Kdiag(self, X, presliced=False):
@@ -576,21 +602,30 @@ class Periodic(Kernel):
     D.J.C.MacKay. Introduction to Gaussian processes. In C.M.Bishop, editor,
     Neural Networks and Machine Learning, pages 133--165. Springer, 1998.
 
-    Derived using the mapping u=(cos(x), sin(x)) on the inputs.
+    Derived using an RBF kernel once mapped the original inputs through
+    the mapping u=(cos(x), sin(x)).
+
+    The resulting kernel can be expressed as:
+    k_per(x, x') = variance * exp( -0.5 Sum_i sin^2((x_i-x'_i) * pi /period)/ell^2)
+    (note that usually we have a factor of 4 instead of 0.5 in front but this is absorbed into ell
+    hyperparameter).
     """
 
     def __init__(self, input_dim, period=1.0, variance=1.0,
                  lengthscales=1.0, active_dims=None, name=None):
         # No ARD support for lengthscale or period yet
         super().__init__(input_dim, active_dims, name=name)
-        self.variance = Parameter(variance, transform=transforms.positive)
-        self.lengthscales = Parameter(lengthscales, transform=transforms.positive)
+        self.variance = Parameter(variance, transform=transforms.positive,
+                                  dtype=settings.float_type)
+        self.lengthscales = Parameter(lengthscales, transform=transforms.positive,
+                                      dtype=settings.float_type)
         self.ARD = False
-        self.period = Parameter(period, transform=transforms.positive)
+        self.period = Parameter(period, transform=transforms.positive,
+                                dtype=settings.float_type)
 
     @params_as_tensors
     def Kdiag(self, X, presliced=False):
-        return tf.fill(tf.stack([tf.shape(X)[0]]), tf.squeeze(self.variance))
+        return tf.fill(tf.shape(X)[:-1], tf.squeeze(self.variance))
 
     @params_as_tensors
     def K(self, X, X2=None, presliced=False):
@@ -600,11 +635,17 @@ class Periodic(Kernel):
             X2 = X
 
         # Introduce dummy dimension so we can use broadcasting
-        f = tf.expand_dims(X, 1)  # now N x 1 x D
-        f2 = tf.expand_dims(X2, 0)  # now 1 x M x D
+        f = tf.expand_dims(X, -2)  #  ... x N x 1 x D
+        f2 = tf.expand_dims(X2, -2) # ... x M x 1 x D
+        K = tf.rank(f2)  # 3, or 4 if broadcasting
+        perm = tf.concat([tf.reshape(tf.range(K-3), [K-3]),  # [], or [0] if broadcasting
+                          tf.reshape(K-2, [1]),  # [1], or [2] if broadcasting
+                          tf.reshape(K-3, [1]),  # [0], or [1] if broadcasting
+                          tf.reshape(K-1, [1])], 0)  # [2], or [2] if broadcasting
+        f2 = tf.transpose(f2, perm)  # ... x 1 x M x D
 
         r = np.pi * (f - f2) / self.period
-        r = tf.reduce_sum(tf.square(tf.sin(r) / self.lengthscales), 2)
+        r = tf.reduce_sum(tf.square(tf.sin(r) / self.lengthscales), -1)
 
         return self.variance * tf.exp(-0.5 * r)
 
@@ -661,33 +702,6 @@ class Coregion(Kernel):
         return tf.gather(Bdiag, X)
 
 
-def make_kernel_names(kern_list):
-    """
-    Take a list of kernels and return a list of strings, giving each kernel a
-    unique name.
-
-    Each name is made from the lower-case version of the kernel's class name.
-
-    Duplicate kernels are given trailing numbers.
-    """
-    names = []
-    counting_dict = {}
-    for k in kern_list:
-        inner_name = k.__class__.__name__.lower()
-
-        # check for duplicates: start numbering if needed
-        if inner_name in counting_dict:
-            if counting_dict[inner_name] == 1:
-                names[names.index(inner_name)] = inner_name + '_1'
-            counting_dict[inner_name] += 1
-            name = inner_name + '_' + str(counting_dict[inner_name])
-        else:
-            counting_dict[inner_name] = 1
-            name = inner_name
-        names.append(name)
-    return names
-
-
 class Combination(Kernel):
     """
     Combine a list of kernels, e.g. by adding or multiplying (see inheriting
@@ -697,27 +711,24 @@ class Combination(Kernel):
     names.
     """
 
-    def __init__(self, kern_list, name=None):
-        if not all(isinstance(k, Kernel) for k in kern_list):
+    def __init__(self, kernels, name=None):
+        if not all(isinstance(k, Kernel) for k in kernels):
             raise TypeError("can only combine Kernel instances")  # pragma: no cover
 
         input_dim = np.max([k.input_dim
                             if type(k.active_dims) is slice else
                             np.max(k.active_dims) + 1
-                            for k in kern_list])
+                            for k in kernels])
         super().__init__(input_dim=input_dim, name=name)
 
         # add kernels to a list, flattening out instances of this class therein
-        self.kern_list = []
-        for k in kern_list:
+        kernels_list = []
+        for k in kernels:
             if isinstance(k, self.__class__):
-                self.kern_list.extend(k.kern_list)
+                kernels_list.extend(k.kernels)
             else:
-                self.kern_list.append(k)
-
-        # generate a set of suitable names and add the kernels as attributes
-        names = make_kernel_names(self.kern_list)
-        [setattr(self, name, k) for name, k in zip(names, self.kern_list)]
+                kernels_list.append(k)
+        self.kernels = ParamList(kernels_list)
 
     @property
     def on_separate_dimensions(self):
@@ -727,11 +738,11 @@ class Combination(Kernel):
         will overlap, so this will always return False.
         :return: Boolean indicator.
         """
-        if np.any([isinstance(k.active_dims, slice) for k in self.kern_list]):
+        if np.any([isinstance(k.active_dims, slice) for k in self.kernels]):
             # Be conservative in the case of a slice object
             return False
         else:
-            dimlist = [k.active_dims for k in self.kern_list]
+            dimlist = [k.active_dims for k in self.kernels]
             overlapping = False
             for i, dims_i in enumerate(dimlist):
                 for dims_j in dimlist[i + 1:]:
@@ -742,18 +753,18 @@ class Combination(Kernel):
 
 class Sum(Combination):
     def K(self, X, X2=None, presliced=False):
-        return reduce(tf.add, [k.K(X, X2) for k in self.kern_list])
+        return reduce(tf.add, [k.K(X, X2) for k in self.kernels])
 
     def Kdiag(self, X, presliced=False):
-        return reduce(tf.add, [k.Kdiag(X) for k in self.kern_list])
+        return reduce(tf.add, [k.Kdiag(X) for k in self.kernels])
 
 
 class Product(Combination):
     def K(self, X, X2=None, presliced=False):
-        return reduce(tf.multiply, [k.K(X, X2) for k in self.kern_list])
+        return reduce(tf.multiply, [k.K(X, X2) for k in self.kernels])
 
     def Kdiag(self, X, presliced=False):
-        return reduce(tf.multiply, [k.Kdiag(X) for k in self.kern_list])
+        return reduce(tf.multiply, [k.Kdiag(X) for k in self.kernels])
 
 # Neural Net kernel
 class NN(Parameterized):
